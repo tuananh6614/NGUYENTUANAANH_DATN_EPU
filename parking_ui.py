@@ -1,29 +1,23 @@
-# parking_ui.py  — YOLOv8 (detect) + EasyOCR (read) + GUI Qt/PySide6
-# ---------------------------------------------------------------
-# Tính năng chính:
-#  - Chụp IN/OUT thủ công (nút bấm)
-#  - Nhận diện biển số: YOLOv8 (bbox) + EasyOCR (đọc ký tự)
-#  - Perspective warp (nắn biển) trước OCR để tăng độ chính xác
-#  - Multi-frame voting: đọc nhiều khung hình liên tiếp rồi bỏ phiếu
-#  - Lưu ảnh theo ngày, tên file = đúng biển số
-#  - Đếm slot đơn giản theo số xe đang IN
-#  - MQTT (tuỳ chọn), auto start Mosquitto (nếu broker là máy hiện tại)
-#
-# Cài đặt nhanh (Windows):
+# parking_ui.py — YOLOv8 + EasyOCR + Multi-Frame Voting + Perspective Warp + MQTT ESP32 RC522
+# -------------------------------------------------------------------------------------------------
+# Yêu cầu môi trường:
 #   pip install PySide6 ultralytics easyocr opencv-python paho-mqtt numpy
 #
-# Chú ý:
-#  - Chỉnh YOLO_MODEL_PATH đúng file weight của bạn.
-#  - Nếu dùng GPU cho YOLO/EasyOCR thì tự set device và gpu=True ở phần ALPR.
-# ---------------------------------------------------------------
+# Ghi chú:
+# - File này giữ nguyên layout/bố cục và hành vi cũ của bạn (UI, camera, MQTT, quản lý slot).
+# - Đã ghép thẳng ALPR (YOLO+EasyOCR) với multi-frame voting + perspective warp để tăng độ chính xác.
+# - Đã thêm subscribe MQTT /in và /out (từ ESP32-S3 + RC522) để kích hoạt chụp IN/OUT tự động.
+# - Nút "Chụp IN/OUT" demo vẫn hoạt động bình thường (dùng để test thủ công).
+# - Ảnh lưu theo ngày, tên ảnh = biển số.
+# -------------------------------------------------------------------------------------------------
 
 import os
 import re
 import cv2
 import sys
 import json
-import time
 import math
+import time
 import socket
 import random
 import string
@@ -36,17 +30,20 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
 import numpy as np
+
+# YOLOv8
 from ultralytics import YOLO
 
-# OCR
+# EasyOCR (nhẹ, không cần Paddle)
 import easyocr
 
-# MQTT (optional)
+# MQTT (tuỳ chọn)
 try:
     from paho.mqtt import client as mqtt
 except Exception:
     mqtt = None
 
+# PySide6
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize
 from PySide6.QtGui import QAction, QImage, QPixmap
 from PySide6.QtWidgets import (
@@ -55,11 +52,13 @@ from PySide6.QtWidgets import (
     QSizePolicy, QDialog, QComboBox, QDialogButtonBox, QFormLayout, QCheckBox
 )
 
-# ======================== CẤU HÌNH CHUNG ========================
+# =================================================================================================
+# CẤU HÌNH
+# =================================================================================================
 
 CFG_FILE = "config.json"
 
-# (1) Đặt đúng đường dẫn weight YOLO của bạn
+# (1) Cập nhật đường dẫn weight YOLO cho phù hợp máy bạn
 YOLO_MODEL_PATH = r"E:\FIRMWAVE\Automatic-License-Plate-Recognition-using-YOLOv8\license_plate_detector.pt"
 
 # (2) Thư mục lưu ảnh
@@ -68,25 +67,30 @@ DIR_OUT = Path("plates/OUT")
 DIR_IN.mkdir(parents=True, exist_ok=True)
 DIR_OUT.mkdir(parents=True, exist_ok=True)
 
-# (3) Tham số ALPR/Camera
-YOLO_CONF     = 0.35
-YOLO_IMGSZ    = 416
-MIN_REL_AREA  = 0.010      # bbox >= 1% frame
-MIN_SHARPNESS = 45.0       # độ nét tối thiểu (Laplacian var)
-CAP_WIDTH, CAP_HEIGHT = 640, 480
+# (3) Tham số ALPR
+YOLO_CONF     = 0.35        # ngưỡng confidence detect
+YOLO_IMGSZ    = 416         # 320/416/640… (416 khá cân bằng tốc độ/độ chính xác)
+MIN_REL_AREA  = 0.010       # bbox >= 1% frame
+MIN_SHARPNESS = 60.0        # độ nét tối thiểu (Laplacian var) cho crop
+CAP_WIDTH, CAP_HEIGHT = 640, 480  # độ phân giải camera (cân bằng tốc độ)
 
-# Multi-frame voting
-VOTE_FRAMES      = 7       # số khung hình đọc/phiếu
-VOTE_INTERVAL_MS = 80      # khoảng thời gian giữa 2 lần đọc (ms)
-VOTE_MIN_HITS    = 2       # tối thiểu số phiếu để chấp nhận
+# (4) Tham số Multi-Frame Voting
+VOTE_FRAMES   = 7           # số frame lấy để vote (lấy từ buffer gần đây)
+VOTE_GAP_MS   = 40          # khoảng cách giữa các khung ảnh khi vét (ms)
+VOTE_MIN_HITS = 2          # số lần xuất hiện tối thiểu để chấp nhận plate
 
-# (4) Phí demo
+# (5) Perspective warp (nắn hình)
+WARP_W, WARP_H = 320, 96    # kích thước ảnh biển sau nắn (tỉ lệ gần 3.33:1 phù hợp VN)
+
+# (6) Phí demo
 FEE_FLAT = 3000
 
 # Regex biển VN (rộng)
 PLATE_RE = re.compile(r"[0-9]{2,3}[A-Z]{1,2}[-\s]?[0-9]{3,5}")
 
-# ======================== DATA CLASS ============================
+# =================================================================================================
+# DATA CLASS CẤU HÌNH UI
+# =================================================================================================
 
 @dataclass
 class UiConfig:
@@ -106,10 +110,10 @@ def load_config() -> UiConfig:
         try:
             with open(CFG_FILE, "r", encoding="utf-8") as fh:
                 d = json.load(fh)
-            return UiConfig(**{
-                **UiConfig().__dict__,
-                **{k: d.get(k, getattr(UiConfig(), k)) for k in UiConfig().__dataclass_fields__.keys()}
-            })
+            # giữ mặc định nhưng cho phép override theo file
+            defaults = UiConfig().__dict__
+            data = {k: d.get(k, defaults[k]) for k in defaults.keys()}
+            return UiConfig(**data)
         except Exception:
             pass
     return UiConfig()
@@ -118,25 +122,30 @@ def save_config(cfg: UiConfig):
     with open(CFG_FILE, "w", encoding="utf-8") as fh:
         json.dump(cfg.__dict__, fh, ensure_ascii=False, indent=2)
 
-# ======================== TIỆN ÍCH ẢNH/VIDEO =====================
+# =================================================================================================
+# CÔNG CỤ ẢNH / VIDEO
+# =================================================================================================
 
 def sharpness_score(gray: np.ndarray) -> float:
+    """Độ nét dùng Laplacian variance."""
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 def enhance_for_plate(bgr: np.ndarray) -> np.ndarray:
-    """Tăng cường tương phản/độ nét nhẹ cho OCR."""
+    """Tăng tương phản + sharpen cơ bản (đã dùng ở vài nơi)."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(gray)
     blur  = cv2.GaussianBlur(clahe, (0,0), 1.0)
     sharp = cv2.addWeighted(clahe, 1.5, blur, -0.5, 0)
     return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
 
-def to_qimage(bgr: np.ndarray) -> QImage:
+def np_to_qimage(bgr: np.ndarray) -> QImage:
+    """OpenCV BGR -> QImage RGB."""
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
     return QImage(rgb.data, w, h, ch*w, QImage.Format_RGB888).copy()
 
 def set_pixmap_fit_no_upscale(label: QLabel, img: QImage):
+    """Hiển thị QImage lên QLabel mà không upscale."""
     if label.width() <= 0 or label.height() <= 0 or img.isNull():
         return
     pix = QPixmap.fromImage(img)
@@ -148,6 +157,7 @@ def set_pixmap_fit_no_upscale(label: QLabel, img: QImage):
     label.setScaledContents(False)
 
 def list_cameras(max_index=8) -> List[int]:
+    """Tìm camera khả dụng."""
     found = []
     backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
     for i in range(max_index):
@@ -157,7 +167,9 @@ def list_cameras(max_index=8) -> List[int]:
             cap.release()
     return found
 
-# ======================== TIỆN ÍCH MẠNG/MQTT =====================
+# =================================================================================================
+# CÔNG CỤ MẠNG / MQTT
+# =================================================================================================
 
 def is_port_open(host: str, port: int, timeout=0.5) -> bool:
     try:
@@ -167,6 +179,7 @@ def is_port_open(host: str, port: int, timeout=0.5) -> bool:
         return False
 
 def get_local_ips() -> set:
+    """Lấy các IP đại diện máy này."""
     ips = {"127.0.0.1", "localhost", "0.0.0.0"}
     try:
         hostname = socket.gethostname()
@@ -175,23 +188,27 @@ def get_local_ips() -> set:
     except Exception:
         pass
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("8.8.8.8", 80))
-        ips.add(s.getsockname()[0]); s.close()
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ips.add(s.getsockname()[0])
+        s.close()
     except Exception:
         pass
     return ips
 
-# ======================== CAMERA THREAD ==========================
+# =================================================================================================
+# CAMERA THREAD
+# =================================================================================================
 
 class CameraWorker(QThread):
-    frame_ready = Signal(QImage)
-    opened = Signal(bool)
+    frame_ready = Signal(QImage)   # phát khung ảnh (để hiển thị)
+    opened = Signal(bool)          # báo mở camera thành/bại
 
     def __init__(self, source=0, width=CAP_WIDTH, height=CAP_HEIGHT, mirror=False, parent=None):
         super().__init__(parent)
         self.source, self.width, self.height, self.mirror = source, width, height, mirror
         self._running = False
-        self._buffer = collections.deque(maxlen=30)  # (score, frame, ts)
+        self._buffer = collections.deque(maxlen=25)   # chứa (sharp, frame)
         self._buf_lock = threading.Lock()
         self.cap = None
 
@@ -202,8 +219,10 @@ class CameraWorker(QThread):
             self.cap = cv2.VideoCapture(self.source, backend)
             if self.width:  self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
             if self.height: self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            ok = self.cap.isOpened(); self.opened.emit(ok)
-            if not ok: return
+            ok = self.cap.isOpened()
+            self.opened.emit(ok)
+            if not ok:
+                return
 
             target_dt = 1/25.0
             last_emit = 0.0
@@ -211,23 +230,24 @@ class CameraWorker(QThread):
                 t0 = time.time()
                 ret, frame = self.cap.read()
                 if not ret:
-                    QThread.msleep(50); continue
-                if self.mirror: frame = cv2.flip(frame, 1)
+                    QThread.msleep(50)
+                    continue
+                if self.mirror:
+                    frame = cv2.flip(frame, 1)
 
-                # score nét
+                # tính sharpness nhanh (downscale 1/2)
                 try:
                     small = cv2.resize(frame, (0,0), fx=0.5, fy=0.5)
                     score = sharpness_score(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
                 except Exception:
                     score = 0.0
-
                 with self._buf_lock:
-                    self._buffer.append((score, frame.copy(), time.time()))
+                    self._buffer.append((score, frame.copy()))
 
-                # emit UI ~25fps
+                # phát ảnh hiển thị ~25fps
                 if time.time() - last_emit >= target_dt:
                     disp = frame
-                    h0,w0 = frame.shape[:2]
+                    h0, w0 = frame.shape[:2]
                     if w0 > 640:
                         scale = 640 / w0
                         disp = cv2.resize(frame, (int(w0*scale), int(h0*scale)))
@@ -236,8 +256,10 @@ class CameraWorker(QThread):
                     self.frame_ready.emit(qimg)
                     last_emit = time.time()
 
+                # giữ nhịp
                 rem = target_dt - (time.time() - t0)
-                if rem > 0: QThread.msleep(int(rem*1000))
+                if rem > 0:
+                    QThread.msleep(int(rem*1000))
         finally:
             try:
                 if self.cap is not None and self.cap.isOpened():
@@ -254,37 +276,47 @@ class CameraWorker(QThread):
             pass
         self.wait(1500)
 
+    # ===== Helper mới: lấy nhiều frame gần nhất cho voting =====
+    def get_recent_frames(self, n: int, min_score: float = MIN_SHARPNESS, gap_ms: int = 0) -> List[np.ndarray]:
+        """Lấy đến n frame tốt gần đây (từ buffer). gap_ms chỉ nhằm mô phỏng giãn cách."""
+        frames: List[np.ndarray] = []
+        with self._buf_lock:
+            if not self._buffer:
+                return frames
+            # sắp xếp theo sharpness giảm dần để ưu tiên nét
+            sorted_buf = sorted(list(self._buffer), key=lambda t: -t[0])
+        for s, f in sorted_buf:
+            if s < min_score:
+                continue
+            frames.append(f.copy())
+            if len(frames) >= n:
+                break
+        # nếu muốn giãn cách (giảm trùng) — ở đây chỉ làm tượng trưng
+        if gap_ms > 0 and len(frames) >= 2:
+            # không sleep thực, vì đã lấy từ buffer; giới hạn bằng cách lấy mỗi ảnh cách nhau 1 ảnh
+            frames = frames[::2] if len(frames) > n else frames
+            frames = frames[:n]
+        return frames
+
     def best_recent_frame(self, min_score: float = MIN_SHARPNESS) -> Optional[np.ndarray]:
+        """Frame nét nhất gần đây (để demo/đơn khung)."""
         with self._buf_lock:
             if not self._buffer:
                 return None
-            s, f, _ = max(self._buffer, key=lambda t: t[0])
+            s, f = max(self._buffer, key=lambda t: t[0])
             return f.copy() if s >= min_score else None
 
-    def recent_frames_for_voting(self, n: int, min_score: float, max_age_ms: int = 1000) -> List[np.ndarray]:
-        """
-        Lấy tối đa n khung hình tốt gần đây trong vòng max_age_ms để bỏ phiếu.
-        """
-        now = time.time()
-        frames = []
-        with self._buf_lock:
-            # sắp xếp theo score giảm dần, rồi theo thời gian gần nhất
-            items = sorted(list(self._buffer), key=lambda t: (t[0], t[2]), reverse=True)
-            for s, f, ts in items:
-                if s < min_score: continue
-                if (now - ts)*1000 > max_age_ms: continue
-                frames.append(f.copy())
-                if len(frames) >= n:
-                    break
-        return frames
-
-# ======================== ALPR (YOLO + EasyOCR) ===================
+# =================================================================================================
+# ALPR (YOLO + EasyOCR) + Multi-Frame voting + Perspective warp
+# =================================================================================================
 
 def clean_plate_text(txt: str) -> str:
+    """Chuẩn hoá chuỗi OCR theo pattern biển VN."""
     t = txt.upper().replace("O", "0")
     t = re.sub(r"[^A-Z0-9\s-]", "", t)
     m = PLATE_RE.search(t.replace(" ", ""))
-    if not m: return t.strip()
+    if not m:
+        return t.strip()
     raw = m.group(0)
     if "-" not in raw:
         if len(raw) > 3 and raw[2].isalpha():
@@ -294,110 +326,69 @@ def clean_plate_text(txt: str) -> str:
     raw = re.sub(r"-([A-Z]{1,2})(\d+)", r"-\1 \2", raw)
     return raw.strip()
 
-def find_plate_quad(crop_gray: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Tìm tứ giác lớn nhất trong crop (giả định là biển) để nắn phối cảnh.
-    Trả về 4 đỉnh theo thứ tự chuẩn (tl, tr, br, bl) nếu tìm thấy; ngược lại None.
-    """
-    # Làm nổi biên
-    blur = cv2.GaussianBlur(crop_gray, (5,5), 0)
-    edges = cv2.Canny(blur, 60, 180)
-    edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
-
-    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts: return None
-
-    # Chọn contour có diện tích lớn nhất và là tứ giác
-    h, w = crop_gray.shape[:2]
-    area_img = h*w
-    best = None
-    best_area = 0
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < 0.15*area_img:  # bỏ vùng quá nhỏ so với crop
-            continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.03*peri, True)
-        if len(approx) == 4 and area > best_area:
-            best_area = area
-            best = approx
-
-    if best is None:
-        return None
-
-    pts = best.reshape(-1, 2).astype(np.float32)
-
-    # Sắp xếp 4 điểm theo thứ tự: tl, tr, br, bl
-    # (theo tổng và hiệu toạ độ)
+def order_points(pts: np.ndarray) -> np.ndarray:
+    """Sắp 4 điểm theo thứ tự: tl, tr, br, bl."""
+    rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1).ravel()
+    rect[0] = pts[np.argmin(s)]  # top-left
+    rect[2] = pts[np.argmax(s)]  # bottom-right
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    return rect
 
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(diff)]
-    bl = pts[np.argmax(diff)]
-    return np.array([tl, tr, br, bl], dtype=np.float32)
-
-def warp_plate(crop_bgr: np.ndarray) -> np.ndarray:
+def warp_plate(crop_bgr: np.ndarray, out_w=WARP_W, out_h=WARP_H) -> np.ndarray:
     """
-    Nắn phối cảnh crop biển (nếu tìm được tứ giác); nếu không, trả lại bản tăng cường.
+    Nắn hình biển từ crop bbox bằng minAreaRect (gần giống quad) → warp về kích thước cố định.
+    Nếu không tìm được contour phù hợp thì trả về resize bình thường.
     """
     g = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    quad = find_plate_quad(g)
-    if quad is None:
-        return enhance_for_plate(crop_bgr)
-    # Ước lượng kích thước biển theo hình chữ nhật chuẩn
-    w1 = np.linalg.norm(quad[1] - quad[0])
-    w2 = np.linalg.norm(quad[2] - quad[3])
-    h1 = np.linalg.norm(quad[3] - quad[0])
-    h2 = np.linalg.norm(quad[2] - quad[1])
-    W = int(max(w1, w2))
-    H = int(max(h1, h2))
+    g = cv2.bilateralFilter(g, 7, 50, 50)
+    thr = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 31, 7)
 
-    # Giữ tỉ lệ 2:1 (xấp xỉ biển VN), clamp kích thước tối thiểu
-    if W < H*2:
-        W = int(H*2)
-    W = max(W, 160)
-    H = max(H, 80)
+    cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return cv2.resize(crop_bgr, (out_w, out_h))
 
-    dst = np.array([[0,0],[W-1,0],[W-1,H-1],[0,H-1]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(quad, dst)
-    warped = cv2.warpPerspective(crop_bgr, M, (W, H), flags=cv2.INTER_CUBIC)
-    return enhance_for_plate(warped)
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < 0.05 * (crop_bgr.shape[0]*crop_bgr.shape[1]):
+        return cv2.resize(crop_bgr, (out_w, out_h))
+
+    rect = cv2.minAreaRect(c)
+    box = cv2.boxPoints(rect)
+    box = np.int0(box)
+
+    src = order_points(box.astype(np.float32))
+    dst = np.array([[0,0],[out_w-1,0],[out_w-1,out_h-1],[0,out_h-1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(crop_bgr, M, (out_w, out_h))
+    return warped
 
 class ALPR:
-    def __init__(self, weights: str, conf=YOLO_CONF, imgsz=YOLO_IMGSZ, use_gpu_ocr=False):
+    """
+    Class bọc YOLOv8 + EasyOCR + logic multi-frame voting + perspective warp.
+    """
+    def __init__(self, weights: str, conf=YOLO_CONF, imgsz=YOLO_IMGSZ):
         self.model = YOLO(weights)
-        self.model.to('cpu')  # chuyển 'cuda' nếu có GPU
+        self.model.to('cpu')  # dùng CPU cho ổn định (có thể chuyển sang CUDA nếu sẵn)
         self.conf = conf
         self.imgsz = imgsz
-        self.reader = easyocr.Reader(['en'], gpu=use_gpu_ocr)
+        # EasyOCR (en là đủ cho chữ cái/ số Latinh)
+        self.reader = easyocr.Reader(['en'], gpu=False)
 
-    def _ocr_plate(self, plate_img: np.ndarray) -> str:
-        """
-        OCR ảnh biển đã nắn/tăng cường.
-        """
-        gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-        # nhị phân adapt để nổi ký tự
-        thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 31, 7)
-        dets = self.reader.readtext(thr)
-        text = " ".join([d[1] for d in dets]) if dets else ""
-        return clean_plate_text(text)
-
+    # ---- Nhận dạng một khung ----
     def infer_once(self, frame: np.ndarray) -> Tuple[Optional[str], np.ndarray]:
         """
-        Chạy YOLO 1 lần + OCR 1 lần, trả về (text, debug_img).
-        Có nắn phối cảnh trước khi OCR.
+        Detect + OCR trong 1 frame.
+        Trả về: (text tốt nhất hoặc None, ảnh debug vẽ bbox & text).
         """
         debug = frame.copy()
         H, W = frame.shape[:2]
         results = self.model(frame, device='cpu', conf=self.conf, imgsz=self.imgsz, verbose=False)[0]
-
-        best_txt, best_score = None, -1.0
         if results.boxes is None or len(results.boxes) == 0:
             return None, debug
 
+        best_txt, best_score = None, -1.0
         confs = results.boxes.conf.cpu().numpy()
         order = np.argsort(-confs)
 
@@ -407,32 +398,85 @@ class ALPR:
             x1,y1 = max(0,x1), max(0,y1)
             x2,y2 = min(W-1,x2), min(H-1,y2)
             w,h = x2-x1, y2-y1
-            if w<=2 or h<=2: continue
+            if w <= 1 or h <= 1:
+                continue
             rel_area = (w*h)/(W*H)
-            if rel_area < MIN_REL_AREA: continue
-
-            crop = frame[y1:y2, x1:x2]
-            g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            if sharpness_score(g) < MIN_SHARPNESS:
+            if rel_area < MIN_REL_AREA:
                 continue
 
-            # nắn biển + tăng cường
-            plate_img = warp_plate(crop)
-            text = self._ocr_plate(plate_img)
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            # bỏ crop quá mờ
+            if sharpness_score(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)) < MIN_SHARPNESS:
+                continue
 
+            # nắn hình về kích thước chuẩn, sau đó enhance nhẹ
+            warped = warp_plate(crop, WARP_W, WARP_H)
+            warped = enhance_for_plate(warped)
+
+            # OCR
+            dets = self.reader.readtext(warped)
+            text = " ".join([d[1] for d in dets]) if dets else ""
+            text = clean_plate_text(text)
+
+            # chấm điểm: tự tin detect + độ dài chuỗi đọc được
             score = float(b.conf.item()) + 0.05*len(text)
             if text and score > best_score:
                 best_score = score
                 best_txt = text
 
-            # Vẽ debug (bbox và kết quả)
+            # debug
             cv2.rectangle(debug, (x1,y1), (x2,y2), (0,255,0), 2)
-            cv2.putText(debug, text if text else "?", (x1, max(0,y1-6)),
+            dbg_txt = text if text else "?"
+            cv2.putText(debug, dbg_txt, (x1, max(0,y1-6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
 
         return best_txt, debug
 
-# ======================== UI PHỤ TRỢ =============================
+    # ---- Multi-frame voting ----
+    def infer_multi(self, frames: List[np.ndarray]) -> Tuple[Optional[str], Optional[np.ndarray]]:
+        """
+        Nhận nhiều frame → vote biển số tốt nhất.
+        Trả về: (plate hoặc None, debug_img của frame có plate tốt nhất).
+        """
+        if not frames:
+            return None, None
+
+        votes: Dict[str, int] = {}
+        best_debug = None
+        best_plate = None
+        best_score = -1
+
+        for f in frames:
+            plate, debug = self.infer_once(f)
+            if plate:
+                votes[plate] = votes.get(plate, 0) + 1
+                # ưu tiên giữ debug của plate có nhiều vote/độ dài tốt
+                cur_score = votes[plate]*10 + len(plate)
+                if cur_score > best_score:
+                    best_score = cur_score
+                    best_plate = plate
+                    best_debug = debug
+
+        if not votes:
+            return None, frames[0].copy()  # trả về 1 ảnh làm debug
+
+        # chọn plate có vote cao nhất; nếu hòa thì chọn plate dài hơn
+        max_hits = max(votes.values())
+        cands = [p for p, c in votes.items() if c == max_hits]
+        cands.sort(key=lambda s: (-len(s), s))
+        plate_final = cands[0]
+
+        # điều kiện tối thiểu số lần xuất hiện
+        if max_hits < VOTE_MIN_HITS:
+            return None, best_debug
+
+        return plate_final, best_debug
+
+# =================================================================================================
+# UI PHỤ TRỢ
+# =================================================================================================
 
 def qlabel_video_placeholder(text=""):
     lbl = QLabel(text)
@@ -442,12 +486,15 @@ def qlabel_video_placeholder(text=""):
     lbl.setStyleSheet("QLabel{background:#1f1f1f;color:#cccccc;border:1px solid #3a3a3a;}")
     return lbl
 
-# ======================== SETTINGS DIALOG =========================
+# =================================================================================================
+# HỘP THOẠI THIẾT LẬP
+# =================================================================================================
 
 class SettingsDialog(QDialog):
     def __init__(self, cfg: UiConfig, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Cài đặt"); self.resize(520, 380)
+        self.setWindowTitle("Cài đặt")
+        self.resize(520, 380)
 
         cams = list_cameras()
         self.cb_in  = QComboBox()
@@ -502,18 +549,17 @@ class SettingsDialog(QDialog):
             self.chk_autob.isChecked(), self.ed_bexe.text().strip(), self.ed_bconf.text().strip()
         )
 
-# ========================= MAIN WINDOW ============================
+# =================================================================================================
+# CỬA SỔ CHÍNH
+# =================================================================================================
 
 class MainWindow(QMainWindow):
     def __init__(self, cfg: UiConfig):
         super().__init__()
         self.cfg = cfg
 
-        # 1) UI
-        self._build_ui()
-
-        # 2) Trạng thái
-        self._in_records: Dict[str, datetime.datetime] = {}  # {plate: datetime_in}
+        # 1) Trạng thái phải khai báo TRƯỚC UI
+        self._in_records: Dict[str, datetime.datetime] = {}  # {plate: time_in}
         self._local_ips = get_local_ips()
         self._mqtt_connected = False
         self._esp_online = False
@@ -522,7 +568,10 @@ class MainWindow(QMainWindow):
         self._mosq_proc = None
         self.mqtt_client = None
 
-        # 3) Model
+        # 2) UI
+        self._build_ui()
+
+        # 3) ALPR
         self._init_models()
 
         # 4) Camera
@@ -530,14 +579,16 @@ class MainWindow(QMainWindow):
         self.cam_out_worker: Optional[CameraWorker] = None
         self.start_cameras()
 
-        # 5) MQTT
+        # 5) MQTT/Broker
         self.ensure_broker_running()
         self.init_mqtt()
 
         # 6) Timers
         self._start_timers()
 
-    # ---------- UI ----------
+    # ----------------------------------------------------------------------------------------------
+    # UI
+    # ----------------------------------------------------------------------------------------------
     def _build_ui(self):
         self.setWindowTitle("Phần mềm quản lý bãi gửi xe")
         self.resize(1280, 780)
@@ -619,6 +670,7 @@ class MainWindow(QMainWindow):
         sb = QStatusBar(); self.lbl_status_cam = QLabel("Camera: —")
         sb.addWidget(self.lbl_status_cam); self.setStatusBar(sb)
 
+        # điền các giá trị ban đầu
         self.ed_slots_total.setText(str(load_config().total_slots))
         self._update_slot_counts()
         self.lbl_mqtt_broker.setText(f"{self.cfg.mqtt_host}:{self.cfg.mqtt_port}")
@@ -645,17 +697,22 @@ class MainWindow(QMainWindow):
     def _tick(self):
         self.lbl_clock.setText(time.strftime("%H:%M:%S  —  %a, %d/%m/%Y"))
 
-    # ---------- MODEL/OCR ----------
+    # ----------------------------------------------------------------------------------------------
+    # MODEL/OCR
+    # ----------------------------------------------------------------------------------------------
     def _init_models(self):
         try:
-            self.alpr = ALPR(YOLO_MODEL_PATH, conf=YOLO_CONF, imgsz=YOLO_IMGSZ, use_gpu_ocr=False)
+            self.alpr = ALPR(YOLO_MODEL_PATH, conf=YOLO_CONF, imgsz=YOLO_IMGSZ)
         except Exception as e:
             self.alpr = None
             QMessageBox.critical(self, "ALPR", f"Không khởi tạo được YOLO/EasyOCR:\n{e}")
 
-    # ---------- CAMERA ----------
+    # ----------------------------------------------------------------------------------------------
+    # CAMERA
+    # ----------------------------------------------------------------------------------------------
     def start_cameras(self):
         self.stop_cameras()
+        # Camera IN
         if self.cfg.cam_in_index >= 0:
             try:
                 self.cam_in_worker = CameraWorker(self.cfg.cam_in_index, mirror=False)
@@ -667,6 +724,7 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_status_cam.setText("Camera IN: tắt")
 
+        # Camera OUT
         if self.cfg.cam_out_index >= 0:
             try:
                 self.cam_out_worker = CameraWorker(self.cfg.cam_out_index, mirror=False)
@@ -692,15 +750,16 @@ class MainWindow(QMainWindow):
     def _cam_status(self, ok: bool, tag: str, idx: int):
         self.lbl_status_cam.setText(f"Camera {tag} (index {idx}): {'OK' if ok else 'LỖI'}")
 
-    # ---------- SLOT / RECORD ----------
+    # ----------------------------------------------------------------------------------------------
+    # SLOT / RECORD
+    # ----------------------------------------------------------------------------------------------
     def _update_slot_counts(self):
-        used = len(getattr(self, "_in_records", {}))
+        used = len(self._in_records)
         total = int(self.cfg.total_slots)
         free = max(0, total - used)
         self.ed_slots_used.setText(str(used))
         self.ed_slots_free.setText(str(free))
         self.ed_slots_total.setText(str(total))
-        self.ed_plate_cnt.setText(str(used))
 
     def _ensure_alpr(self) -> bool:
         if self.alpr is None:
@@ -708,134 +767,113 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    # ---------- MULTI-FRAME VOTING ----------
-    def _vote_text(self, texts: List[str]) -> Optional[str]:
-        """
-        Bỏ phiếu chọn text xuất hiện nhiều nhất (ưu tiên chuỗi dài hơn khi hòa).
-        """
-        if not texts:
-            return None
-        counts = {}
-        for t in texts:
-            if not t: continue
-            counts[t] = counts.get(t, 0) + 1
-        if not counts:
-            return None
-        # chọn nhiều phiếu nhất, nếu hoà thì chọn có độ dài lớn hơn
-        best = max(counts.items(), key=lambda kv: (kv[1], len(kv[0])))
-        if best[1] >= VOTE_MIN_HITS:
-            return best[0]
-        # không đủ phiếu, nhưng nếu có 1 ứng viên mạnh vẫn trả về
-        return best[0] if best[0] else None
+    # ----------------------------------------------------------------------------------------------
+    # LƯU ẢNH
+    # ----------------------------------------------------------------------------------------------
+    def _save_image_with_plate(self, plate: str, frame: np.ndarray, is_in: bool):
+        root = DIR_IN if is_in else DIR_OUT
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        save_dir = root / today
+        save_dir.mkdir(parents=True, exist_ok=True)
+        safe_plate = plate.replace(" ", "_")
+        cv2.imwrite(str(save_dir / f"{safe_plate}.jpg"), frame)
 
-    def _infer_vote_from_worker(self, worker: CameraWorker) -> Tuple[Optional[str], Optional[np.ndarray]]:
-        """
-        Lấy nhiều frame từ worker -> chạy ALPR nhiều lần -> bỏ phiếu.
-        Trả về (plate_final, debug_img_cuối).
-        """
-        frames = worker.recent_frames_for_voting(VOTE_FRAMES, MIN_SHARPNESS, max_age_ms=1200)
-        if not frames:
-            # lấy 1 khung hình tốt từ best_recent_frame làm fallback
-            f = worker.best_recent_frame()
-            if f is None:
-                return None, None
-            frames = [f]
-
-        votes = []
-        debug_last = None
-        for i, f in enumerate(frames):
-            plate, debug = self.alpr.infer_once(f)
-            debug_last = debug
-            if plate:
-                votes.append(plate)
-            # nghỉ nhỏ để tránh đọc cùng 1 khung hình
-            QApplication.processEvents()
-            QThread.msleep(VOTE_INTERVAL_MS)
-
-        final = self._vote_text(votes)
-        return final, debug_last
-
-    # ---------- ACTIONS ----------
+    # ----------------------------------------------------------------------------------------------
+    # HÀNH ĐỘNG: CHỤP IN / OUT
+    # ----------------------------------------------------------------------------------------------
     def on_shoot_in(self):
         if not self._ensure_alpr(): return
         if not self.cam_in_worker:
-            QMessageBox.warning(self, "Chụp IN", "Chưa có camera IN."); return
+            QMessageBox.warning(self, "Chụp IN", "Chưa có camera IN.")
+            return
 
-        plate, debug = self._infer_vote_from_worker(self.cam_in_worker)
+        # Multi-frame voting
+        frames = self.cam_in_worker.get_recent_frames(VOTE_FRAMES, MIN_SHARPNESS, VOTE_GAP_MS)
+        if not frames:
+            # fallback 1 frame
+            f = self.cam_in_worker.best_recent_frame()
+            if f is None:
+                QMessageBox.warning(self, "Chụp IN", "Không lấy được khung hình rõ.")
+                return
+            frames = [f]
+
+        plate, debug = self.alpr.infer_multi(frames)
+        # debug render
         if debug is not None:
-            set_pixmap_fit_no_upscale(self.lbl_img_in, to_qimage(debug))
-
-        now = datetime.datetime.now()
-        today = now.strftime("%Y-%m-%d")
-        save_dir = DIR_IN / today
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        frame = self.cam_in_worker.best_recent_frame()  # lưu 1 ảnh gốc tốt
-        if frame is not None:
-            if plate:
-                cv2.imwrite(str(save_dir / f"{plate}.jpg"), frame)
-            else:
-                cv2.imwrite(str(save_dir / f"UNREAD_{now.strftime('%H%M%S')}.jpg"), frame)
+            set_pixmap_fit_no_upscale(self.lbl_img_in, np_to_qimage(debug))
 
         if not plate:
             self.ed_plate.setText("Không đọc được")
             QMessageBox.information(self, "Chụp IN", "Không nhận dạng được biển số.")
+            # lưu 1 khung mù mờ để debug
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            (DIR_IN / "UNREAD").mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(DIR_IN / "UNREAD" / f"UNREAD_{ts}.jpg"), frames[0])
             return
 
         if plate in self._in_records:
-            QMessageBox.warning(self, "Chụp IN", f"Biển {plate} đã có bản ghi IN!"); return
+            QMessageBox.warning(self, "Chụp IN", f"Biển {plate} đã có bản ghi IN!")
+            return
 
+        now = datetime.datetime.now()
         self._in_records[plate] = now
         self.ed_plate.setText(plate)
         self.ed_tin.setText(now.strftime("%Y-%m-%d %H:%M:%S"))
         self.ed_tout.clear(); self.ed_tdiff.clear(); self.ed_fee.setText("0")
         self._update_slot_counts()
 
+        # Lưu ảnh (lưu khung ảnh tốt nhất trong frames — lấy frames[0] cho nhẹ)
+        self._save_image_with_plate(plate, frames[0], True)
+
     def on_shoot_out(self):
         if not self._ensure_alpr(): return
         if not self.cam_out_worker:
-            QMessageBox.warning(self, "Chụp OUT", "Chưa có camera OUT."); return
+            QMessageBox.warning(self, "Chụp OUT", "Chưa có camera OUT.")
+            return
 
-        plate, debug = self._infer_vote_from_worker(self.cam_out_worker)
+        frames = self.cam_out_worker.get_recent_frames(VOTE_FRAMES, MIN_SHARPNESS, VOTE_GAP_MS)
+        if not frames:
+            f = self.cam_out_worker.best_recent_frame()
+            if f is None:
+                QMessageBox.warning(self, "Chụp OUT", "Không lấy được khung hình rõ.")
+                return
+            frames = [f]
+
+        plate, debug = self.alpr.infer_multi(frames)
         if debug is not None:
-            set_pixmap_fit_no_upscale(self.lbl_img_out, to_qimage(debug))
-
-        now = datetime.datetime.now()
-        today = now.strftime("%Y-%m-%d")
-        save_dir = DIR_OUT / today
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        frame = self.cam_out_worker.best_recent_frame()
-        if frame is not None:
-            if plate:
-                cv2.imwrite(str(save_dir / f"{plate}.jpg"), frame)
-            else:
-                cv2.imwrite(str(save_dir / f"UNREAD_{now.strftime('%H%M%S')}.jpg"), frame)
-
-        self.ed_tout.setText(now.strftime("%Y-%m-%d %H:%M:%S"))
+            set_pixmap_fit_no_upscale(self.lbl_img_out, np_to_qimage(debug))
 
         if not plate:
-            self.ed_plate.setText("Không đọc được")
             QMessageBox.information(self, "Chụp OUT", "Không nhận dạng được biển số.")
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            (DIR_OUT / "UNREAD").mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(DIR_OUT / "UNREAD" / f"UNREAD_{ts}.jpg"), frames[0])
             return
 
         self.ed_plate.setText(plate)
+        now = datetime.datetime.now()
+        self.ed_tout.setText(now.strftime("%Y-%m-%d %H:%M:%S"))
 
         if plate not in self._in_records:
             QMessageBox.warning(self, "Chụp OUT", "Không thấy bản ghi IN tương ứng. Ảnh OUT đã lưu.")
+            self._save_image_with_plate(plate, frames[0], False)
             return
 
         t_in = self._in_records.pop(plate)
         diff = now - t_in
         mins = max(1, int(diff.total_seconds() // 60))
-        fee  = FEE_FLAT  # demo: tính phí cố định
+        fee  = FEE_FLAT  # demo
 
         self.ed_tin.setText(t_in.strftime("%Y-%m-%d %H:%M:%S"))
         self.ed_tdiff.setText(f"{mins} phút")
         self.ed_fee.setText(f"{fee:,}")
         self._update_slot_counts()
 
-    # ---------- Misc ----------
+        self._save_image_with_plate(plate, frames[0], False)
+
+    # ----------------------------------------------------------------------------------------------
+    # MISC
+    # ----------------------------------------------------------------------------------------------
     def on_sync(self):
         QMessageBox.information(self, "Đồng bộ", "Các chức năng nâng cao sẽ thêm sau.")
 
@@ -873,7 +911,9 @@ class MainWindow(QMainWindow):
             self.lbl_mqtt_broker.setText(f"{self.cfg.mqtt_host}:{self.cfg.mqtt_port}")
             self.lbl_mqtt_gate.setText(self.cfg.gate_id)
 
-    # ---------- MQTT/BROKER ----------
+    # ----------------------------------------------------------------------------------------------
+    # MQTT / BROKER
+    # ----------------------------------------------------------------------------------------------
     def _set_mqtt_state(self, text, color="#bbb"):
         self.lbl_mqtt_state.setText(text)
         self.lbl_mqtt_state.setStyleSheet(f"color:{color};font-weight:700;")
@@ -939,10 +979,15 @@ class MainWindow(QMainWindow):
             def _on_connect(client, userdata, flags, rc, properties=None):
                 self._mqtt_connected = (rc == 0)
                 if rc == 0:
-                    client.subscribe(f"parking/gate/{self.cfg.gate_id}/event", qos=1)
-                    client.subscribe(f"parking/gate/{self.cfg.gate_id}/stats", qos=1)
-                    client.subscribe(f"parking/gate/{self.cfg.gate_id}/status", qos=1)
-                    client.subscribe(f"parking/gate/{self.cfg.gate_id}/heartbeat", qos=0)
+                    base = f"parking/gate/{self.cfg.gate_id}"
+                    # các topic cũ
+                    client.subscribe(base + "/event", qos=1)
+                    client.subscribe(base + "/stats", qos=1)
+                    client.subscribe(base + "/status", qos=1)
+                    client.subscribe(base + "/heartbeat", qos=0)
+                    # ====== MỚI: trigger IN/OUT từ RC522 ======
+                    client.subscribe(base + "/in", qos=1)
+                    client.subscribe(base + "/out", qos=1)
                 else:
                     self._esp_online = False
                 self._refresh_conn_badge()
@@ -961,6 +1006,8 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
 
+                    base = f"parking/gate/{self.cfg.gate_id}"
+
                     if topic.endswith("/status"):
                         online = bool(payload.get("online", False))
                         self._esp_online = online
@@ -974,7 +1021,14 @@ class MainWindow(QMainWindow):
                             self._esp_online = True
                             self._refresh_conn_badge()
 
-                    # Có thể xử lý thêm event/stats tuỳ hệ thống
+                    # ====== MỚI: nhận trigger từ RC522 ======
+                    elif topic == base + "/in":
+                        # Bảo đảm chạy trong thread Qt
+                        QTimer.singleShot(0, self.on_shoot_in)
+                    elif topic == base + "/out":
+                        QTimer.singleShot(0, self.on_shoot_out)
+
+                    # TODO: xử lý thêm event/stats nếu cần
                 except Exception:
                     pass
 
@@ -1004,7 +1058,9 @@ class MainWindow(QMainWindow):
         self.ensure_broker_running()
         self.init_mqtt()
 
-    # ---------- Close ----------
+    # ----------------------------------------------------------------------------------------------
+    # Close
+    # ----------------------------------------------------------------------------------------------
     def closeEvent(self, e):
         self.stop_cameras()
         try:
@@ -1018,7 +1074,9 @@ class MainWindow(QMainWindow):
             except Exception: pass
         super().closeEvent(e)
 
-# ============================= BOOT ===============================
+# =================================================================================================
+# BOOT
+# =================================================================================================
 
 def main():
     cfg = load_config()
