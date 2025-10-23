@@ -2,6 +2,7 @@
 .venv/
 venv/
 plates/
+.claude/
 
 # Python cache & build
 __pycache__/

@@ -61,9 +61,6 @@ from PySide6.QtWidgets import (
     QSizePolicy, QDialog, QComboBox, QDialogButtonBox, QFormLayout, QCheckBox
 )
 
-# ✅ MySQL Database
-from database import ParkingDB
-
 # =================================================================================================
 # CẤU HÌNH
 # =================================================================================================
@@ -807,16 +804,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cfg = cfg
 
-        # ✅ MySQL Database connection
-        try:
-            self.db = ParkingDB()
-            logging.info("[DB] MySQL connected successfully")
-        except Exception as e:
-            logging.error(f"[DB] Failed to connect MySQL: {e}")
-            self.db = None
-
         # Lưu theo mã thẻ: {card_id: {"plate": "...", "time": datetime, "card_id": ..., "paid": False}}
-        # ✅ NOTE: Giữ _in_records làm cache trong memory, sync với MySQL
         self._in_records: Dict[str, Dict] = {}
         self._paid_cards: Dict[str, datetime.datetime] = {}  # ✅ NEW: {card_id: paid_time}
         self._rec_lock = threading.RLock()
@@ -963,29 +951,40 @@ class MainWindow(QMainWindow):
         self.lbl_mqtt_gate.setText(self.cfg.gate_id)
 
     def _load_data_from_db(self):
-        """✅ NEW: Load dữ liệu từ MySQL database"""
+        """✅ NEW: Load dữ liệu từ in_records.json với structure mới"""
         try:
-            if not self.db:
-                logging.warning("[DB] MySQL not connected, skipping data load")
-                return
+            if os.path.exists("in_records.json"):
+                with open("in_records.json", "r", encoding="utf-8") as f:
+                    data = json.load(f)
 
-            # Load vehicles currently in parking from MySQL
-            vehicles = self.db.get_all_vehicles_in_parking()
-            for v in vehicles:
-                card_id = v['rfid']
-                self._in_records[card_id] = {
-                    'card_id': card_id,
-                    'plate': v['plate'] or '',
-                    'time': v['entry_time'],
-                    'img_path': v['entry_image'] or '',
-                    'paid': False
-                }
+                # Kiểm tra cấu trúc mới (có summary và vehicles)
+                if "summary" in data and "vehicles" in data:
+                    summary = data["summary"]
+                    vehicles = data["vehicles"]
 
-            # Calculate today's revenue
-            self._total_revenue = int(self.db.get_today_revenue() or 0)
-            self._total_in_count = self.db.get_today_vehicles_count()
+                    # Load summary
+                    self._total_revenue = summary.get("total_revenue", 0)
+                    self._total_in_count = summary.get("daily_in_count", 0)
+                    last_date = summary.get("last_date", "")
 
-            logging.info(f"[DB] Loaded from MySQL: revenue={self._total_revenue:,}, today_count={self._total_in_count}, vehicles_in={len(self._in_records)}")
+                    # Check qua ngày chưa
+                    today = datetime.datetime.now().strftime("%Y-%m-%d")
+                    if last_date != today:
+                        logging.info(f"Date changed from {last_date} to {today} - Reset daily counter")
+                        self._total_in_count = 0
+
+                    # Load vehicles
+                    for card_id, record in vehicles.items():
+                        record["time"] = datetime.datetime.fromisoformat(record["time"])
+                        self._in_records[card_id] = record
+
+                    logging.info(f"Loaded summary: revenue={self._total_revenue:,}, count={self._total_in_count}, vehicles={len(self._in_records)}")
+                else:
+                    # Cấu trúc cũ (backward compatibility)
+                    for card_id, record in data.items():
+                        record["time"] = datetime.datetime.fromisoformat(record["time"])
+                        self._in_records[card_id] = record
+                    logging.info(f"Loaded old format: {len(self._in_records)} vehicles")
 
             # ✅ Update UI với dữ liệu đã load
             self.ed_total_revenue.setText(f"{self._total_revenue:,}")
@@ -993,18 +992,53 @@ class MainWindow(QMainWindow):
             self._update_slot_counts()
 
         except Exception as e:
-            logging.error(f"[DB] Error loading from MySQL: {e}", exc_info=True)
+            logging.error(f"Error loading in_records.json: {e}", exc_info=True)
+
+    def _save_data_to_db(self):
+        """✅ NEW: Lưu dữ liệu vào in_records.json với structure mới"""
+        try:
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+
+            # Convert in_records to serializable format
+            vehicles = {}
+            for card_id, record in self._in_records.items():
+                vehicles[card_id] = {
+                    "plate": record["plate"],
+                    "time": record["time"].isoformat(),
+                    "card_id": record["card_id"],
+                    "paid": record.get("paid", False)
+                }
+
+            data = {
+                "summary": {
+                    "total_revenue": self._total_revenue,
+                    "daily_in_count": self._total_in_count,
+                    "last_date": today
+                },
+                "vehicles": vehicles
+            }
+
+            with open("in_records.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            logging.info(f"Saved in_records.json: revenue={self._total_revenue:,}, count={self._total_in_count}, vehicles={len(vehicles)}")
+        except Exception as e:
+            logging.error(f"Error saving in_records.json: {e}", exc_info=True)
 
     def _check_midnight(self):
         """✅ NEW: Kiểm tra và reset daily counter vào 00:00"""
         try:
-            # No need to check JSON anymore, just reset counter daily
-            # MySQL keeps full history, so this is just for UI display
-            current_hour = datetime.datetime.now().hour
-            if current_hour == 0 and self._total_in_count > 0:
-                logging.info(f"Midnight reset: daily counter reset")
-                self._total_in_count = 0
-                self.ed_plate_cnt.setText("0")
+            if os.path.exists("in_records.json"):
+                with open("in_records.json", "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if "summary" in data:
+                        last_date = data["summary"].get("last_date", "")
+                        today = datetime.datetime.now().strftime("%Y-%m-%d")
+                        if last_date != today:
+                            logging.info(f"Midnight reset: {last_date} → {today}")
+                            self._total_in_count = 0
+                            self.ed_plate_cnt.setText("0")
+                            self._save_data_to_db()
         except Exception as e:
             logging.error(f"Error in _check_midnight: {e}")
 
@@ -1266,33 +1300,27 @@ class MainWindow(QMainWindow):
                     return
 
                 now = datetime.datetime.now()
-                img_path = self._save_image_with_plate(plate, frames[0], True)
-
-                # Lưu theo mã thẻ (memory cache)
+                # Lưu theo mã thẻ
                 self._in_records[card_id] = {
                     "plate": plate,
                     "time": now,
-                    "card_id": card_id,
-                    "img_path": img_path
+                    "card_id": card_id
                 }
                 logging.info(f"Recorded IN: Card={card_id}, Plate={plate} at {now}")
-
-                # ✅ Save to MySQL
-                if self.db:
-                    try:
-                        self.db.vehicle_entry(card_id, plate, self.cfg.gate_id, img_path)
-                    except Exception as e:
-                        logging.error(f"[DB] Failed to save vehicle entry: {e}")
 
                 self.ed_plate.setText(plate)
                 self.ed_card.setText(card_id)
                 self.ed_tin.setText(now.strftime("%Y-%m-%d %H:%M:%S"))
                 self.ed_tout.clear(); self.ed_tdiff.clear(); self.ed_fee.setText("0")
                 self._update_slot_counts()
+                self._save_image_with_plate(plate, frames[0], True)
 
                 # ✅ Update daily counter
                 self._total_in_count += 1
                 self.ed_plate_cnt.setText(str(self._total_in_count))
+
+                # ✅ Save to DB
+                self._save_data_to_db()
 
                 logging.info(f"✅ Daily counter updated: {self._total_in_count} vehicles today")
 
@@ -1474,8 +1502,6 @@ class MainWindow(QMainWindow):
                     fee = 0
                     logging.info(f"✅ Already paid via terminal, no fee collected")
 
-                img_path = self._save_image_with_plate(plate, frames[0], False)
-
                 self.ed_plate.setText(plate)
                 self.ed_card.setText(card_id)
                 self.ed_tin.setText(t_in.strftime("%Y-%m-%d %H:%M:%S"))
@@ -1484,18 +1510,10 @@ class MainWindow(QMainWindow):
                 self.ed_fee.setText(f"{fee:,}" if fee > 0 else "Đã thanh toán")
                 self.ed_total_revenue.setText(f"{self._total_revenue:,}")
                 self._update_slot_counts()
+                self._save_image_with_plate(plate, frames[0], False)
 
-                # ✅ Save vehicle exit to MySQL
-                if self.db:
-                    try:
-                        self.db.vehicle_exit(card_id, plate, self.cfg.gate_id, fee, img_path)
-                        # Deduct fee from card balance if applicable
-                        if fee > 0:
-                            card_info = self.db.get_card_info(card_id)
-                            if card_info and card_info.get('card_type') != 'visitor':
-                                self.db.deduct_fee(card_id, fee, self.cfg.gate_id)
-                    except Exception as e:
-                        logging.error(f"[DB] Failed to save vehicle exit: {e}")
+                # ✅ Save to DB
+                self._save_data_to_db()
 
                 logging.info(f"✅ Total revenue: {self._total_revenue:,} VND")
 
@@ -1765,7 +1783,7 @@ class MainWindow(QMainWindow):
 
                             if card_id in self._in_records:
                                 logging.info(f"✅ Card found in records - processing payment")
-                                record = self._in_records[card_id]  # ✅ Don't pop, just mark as paid
+                                record = self._in_records.pop(card_id)
                                 plate = record["plate"]
 
                                 # Update revenue
@@ -1776,16 +1794,8 @@ class MainWindow(QMainWindow):
                                 record["paid"] = True
                                 self._paid_cards[card_id] = datetime.datetime.now()
 
-                                # ✅ Save payment transaction to MySQL
-                                if self.db:
-                                    try:
-                                        card_info = self.db.get_card_info(card_id)
-                                        if card_info:
-                                            # Deduct fee from card
-                                            new_balance = self.db.deduct_fee(card_id, fee, self.cfg.gate_id)
-                                            logging.info(f"[DB] Card balance after payment: {new_balance:,}")
-                                    except Exception as e:
-                                        logging.error(f"[DB] Failed to process payment: {e}")
+                                # Save to DB
+                                self._save_data_to_db()
 
                                 logging.info(f"💰 Payment processed: Card={card_id}, Plate={plate}, Fee={fee:,}, Total={self._total_revenue:,}")
 
@@ -1886,15 +1896,8 @@ class MainWindow(QMainWindow):
                                         record["paid"] = True
                                         self._paid_cards[card_id] = datetime.datetime.now()
 
-                                        # ✅ Save payment to MySQL
-                                        if self.db:
-                                            try:
-                                                card_info = self.db.get_card_info(card_id)
-                                                if card_info:
-                                                    new_balance = self.db.deduct_fee(card_id, fee, self.cfg.gate_id)
-                                                    logging.info(f"[DB] Card balance after payment: {new_balance:,}")
-                                            except Exception as e:
-                                                logging.error(f"[DB] Failed to process payment: {e}")
+                                        # Save to DB
+                                        self._save_data_to_db()
 
                                         logging.info(f"✅ Payment processed via terminal: Card={card_id}, Plate={plate}, Fee={fee:,}, Total={self._total_revenue:,}")
                                         logging.info(f"📝 Vehicle STILL in parking (will exit via RFID-B OUT)")
@@ -1943,14 +1946,9 @@ class MainWindow(QMainWindow):
         """✅ FIXED: Proper cleanup sequence"""
         logging.info("=== CLOSING APPLICATION ===")
 
-        # 1. Close MySQL connection
-        logging.info("Step 1: Closing MySQL connection...")
-        if self.db:
-            try:
-                self.db.close()
-                logging.info("[DB] Connection closed")
-            except Exception as ex:
-                logging.error(f"[DB] Error closing connection: {ex}")
+        # 1. Save data first
+        logging.info("Step 1: Saving data...")
+        self._save_data_to_db()
 
         # 2. Stop cameras
         logging.info("Step 2: Stopping cameras...")
