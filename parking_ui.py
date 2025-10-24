@@ -33,10 +33,6 @@ logging.basicConfig(
 # Torch để tự phát hiện GPU
 try:
     import torch
-    # ✅ FIX: Suppress CUDA capability warning cho RTX 5050 (SM 12.0)
-    import warnings
-    warnings.filterwarnings("ignore", message=".*CUDA capability sm_120 is not compatible.*")
-    warnings.filterwarnings("ignore", message=".*User provided device_type of 'cuda'.*")
 except Exception:
     torch = None
 
@@ -61,16 +57,13 @@ from PySide6.QtWidgets import (
     QSizePolicy, QDialog, QComboBox, QDialogButtonBox, QFormLayout, QCheckBox
 )
 
-# ✅ MySQL Database
-from database import ParkingDB
-
 # =================================================================================================
 # CẤU HÌNH
 # =================================================================================================
 
 CFG_FILE = "config.json"
 
-# GIỮ NGUYÊN đường dẫn model theo yêu cầu của bạn
+# Đường dẫn model YOLO
 YOLO_MODEL_PATH = r"D:\FIRMWAVE\Automatic-License-Plate-Recognition-using-YOLOv8\license_plate_detector.pt"
 
 # Thư mục lưu ảnh
@@ -88,7 +81,7 @@ CAP_WIDTH, CAP_HEIGHT = 640, 480
 
 # Multi-Frame Voting
 VOTE_FRAMES   = 7
-VOTE_GAP_MS   = 40
+VOTE_GAP_MS   = 30
 VOTE_MIN_HITS = 2
 
 # Perspective warp (nắn hình)
@@ -264,51 +257,6 @@ def cleanup_old_images(days_old=3):
 
     except Exception as e:
         logging.error(f"Error in cleanup_old_images: {e}")
-
-def log_system_info():
-    """✅ Log system info to console at startup"""
-    try:
-        import psutil
-
-        logging.info("=" * 80)
-        logging.info("SYSTEM INFO")
-        logging.info("=" * 80)
-
-        # CPU
-        cpu_cores = psutil.cpu_count(logical=False)
-        cpu_threads = psutil.cpu_count(logical=True)
-        logging.info(f"CPU: {cpu_cores} cores / {cpu_threads} threads")
-
-        # RAM
-        ram_gb = psutil.virtual_memory().total / (1024**3)
-        logging.info(f"RAM: {ram_gb:.1f} GB")
-
-        # GPU
-        if torch is not None and hasattr(torch, "cuda"):
-            if torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-                gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                cap = torch.cuda.get_device_capability(0)
-                sm = f"sm_{cap[0]}{cap[1]}"
-
-                if cap[0] > 9:
-                    logging.info(f"GPU: {gpu_name} ({sm} - NOT SUPPORTED by PyTorch)")
-                else:
-                    logging.info(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
-            else:
-                logging.info("GPU: Not detected")
-        else:
-            logging.info("GPU: PyTorch not available")
-
-        # PyTorch
-        if torch is not None:
-            logging.info(f"PyTorch: {torch.__version__}")
-            logging.info(f"CUDA: {torch.version.cuda if torch.version.cuda else 'N/A'}")
-
-        logging.info("=" * 80)
-
-    except Exception as e:
-        logging.error(f"Error logging system info: {e}")
 
 # =================================================================================================
 # CÔNG CỤ MẠNG / MQTT
@@ -536,37 +484,29 @@ def warp_plate(crop_bgr: np.ndarray, out_w=WARP_W, out_h=WARP_H) -> np.ndarray:
     return warped
 
 class ALPR:
-    def __init__(self, weights: str, conf=YOLO_CONF, imgsz=YOLO_IMGSZ,
+    def __init__(self, weights: str, conf=YOLO_CONF, imgsz=YOLO_IMGSZ, 
                  max_workers=4, cache_ttl=5.0, max_cache_size=100):
-        # ✅ NOTE: RTX 5050 has SM 12.0 but PyTorch only supports SM 5.0-9.0
-        # CUDA kernels won't work. Using CPU for now.
-        # TODO: Wait for PyTorch nightly with SM 12.0 support
-        self.device = 'cpu'
-        logging.info(f"[ALPR] Using device: {self.device} (GPU not compatible with this PyTorch build)")
+        # Kiểm tra GPU
+        self.device = 'cuda' if (torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available()) else 'cpu'
+        logging.info(f"ALPR using device: {self.device}")
         
+        # Load YOLO model
         self.model = YOLO(weights)
         try:
             self.model.to(self.device)
-        except Exception:
+            logging.info(f"YOLO model loaded on {self.device}")
+        except Exception as e:
+            logging.warning(f"Failed to move YOLO to GPU: {e}")
             self.device = 'cpu'
             
         self.conf = conf
         self.imgsz = imgsz
-
-        # ✅ FIX: Thêm retry và cleanup cho EasyOCR Reader
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                self.reader = easyocr.Reader(['en'], gpu=(self.device == 'cuda'))
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logging.warning(f"EasyOCR init attempt {attempt + 1} failed: {e}, retrying...")
-                    time.sleep(2)
-                else:
-                    logging.error(f"Failed to initialize EasyOCR after {max_retries} attempts: {e}")
-                    raise
-
+        
+        # Khởi tạo EasyOCR - dùng CPU vì RTX 5050 không tương thích
+        logging.info(f"Initializing EasyOCR with GPU=False (RTX 5050 compatibility)")
+        self.reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        logging.info(f"EasyOCR initialized successfully")
+        
         self.pool = ThreadPoolExecutor(max_workers=max_workers)
         
         # ✅ FIX: Cache with size limit
@@ -610,9 +550,9 @@ class ALPR:
         """✅ NEW: Cleanup when closing app"""
         logging.info("Cleaning up ALPR resources...")
         try:
-            self.pool.shutdown(wait=True)
+            self.pool.shutdown(wait=True, timeout=5)
         except Exception as e:
-            logging.warning(f"Thread pool shutdown error: {e}")
+            logging.error(f"Error shutting down thread pool: {e}")
         
         with self._cache_lock:
             self.cache.clear()
@@ -807,16 +747,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cfg = cfg
 
-        # ✅ MySQL Database connection
-        try:
-            self.db = ParkingDB()
-            logging.info("[DB] MySQL connected successfully")
-        except Exception as e:
-            logging.error(f"[DB] Failed to connect MySQL: {e}")
-            self.db = None
-
         # Lưu theo mã thẻ: {card_id: {"plate": "...", "time": datetime, "card_id": ..., "paid": False}}
-        # ✅ NOTE: Giữ _in_records làm cache trong memory, sync với MySQL
         self._in_records: Dict[str, Dict] = {}
         self._paid_cards: Dict[str, datetime.datetime] = {}  # ✅ NEW: {card_id: paid_time}
         self._rec_lock = threading.RLock()
@@ -846,10 +777,7 @@ class MainWindow(QMainWindow):
         # ✅ NEW: Load dữ liệu từ in_records.json SAU KHI build UI
         self._load_data_from_db()
 
-        # ✅ LAZY LOAD: Initialize ALPR in background (don't block UI)
-        self.alpr = None
-        self._alpr_loading = False
-        threading.Thread(target=self._init_models_async, daemon=True).start()
+        self._init_models()
 
         self.cam_in_worker: Optional[CameraWorker] = None
         self.cam_out_worker: Optional[CameraWorker] = None
@@ -963,29 +891,40 @@ class MainWindow(QMainWindow):
         self.lbl_mqtt_gate.setText(self.cfg.gate_id)
 
     def _load_data_from_db(self):
-        """✅ NEW: Load dữ liệu từ MySQL database"""
+        """✅ NEW: Load dữ liệu từ in_records.json với structure mới"""
         try:
-            if not self.db:
-                logging.warning("[DB] MySQL not connected, skipping data load")
-                return
+            if os.path.exists("in_records.json"):
+                with open("in_records.json", "r", encoding="utf-8") as f:
+                    data = json.load(f)
 
-            # Load vehicles currently in parking from MySQL
-            vehicles = self.db.get_all_vehicles_in_parking()
-            for v in vehicles:
-                card_id = v['rfid']
-                self._in_records[card_id] = {
-                    'card_id': card_id,
-                    'plate': v['plate'] or '',
-                    'time': v['entry_time'],
-                    'img_path': v['entry_image'] or '',
-                    'paid': False
-                }
+                # Kiểm tra cấu trúc mới (có summary và vehicles)
+                if "summary" in data and "vehicles" in data:
+                    summary = data["summary"]
+                    vehicles = data["vehicles"]
 
-            # Calculate today's revenue
-            self._total_revenue = int(self.db.get_today_revenue() or 0)
-            self._total_in_count = self.db.get_today_vehicles_count()
+                    # Load summary
+                    self._total_revenue = summary.get("total_revenue", 0)
+                    self._total_in_count = summary.get("daily_in_count", 0)
+                    last_date = summary.get("last_date", "")
 
-            logging.info(f"[DB] Loaded from MySQL: revenue={self._total_revenue:,}, today_count={self._total_in_count}, vehicles_in={len(self._in_records)}")
+                    # Check qua ngày chưa
+                    today = datetime.datetime.now().strftime("%Y-%m-%d")
+                    if last_date != today:
+                        logging.info(f"Date changed from {last_date} to {today} - Reset daily counter")
+                        self._total_in_count = 0
+
+                    # Load vehicles
+                    for card_id, record in vehicles.items():
+                        record["time"] = datetime.datetime.fromisoformat(record["time"])
+                        self._in_records[card_id] = record
+
+                    logging.info(f"Loaded summary: revenue={self._total_revenue:,}, count={self._total_in_count}, vehicles={len(self._in_records)}")
+                else:
+                    # Cấu trúc cũ (backward compatibility)
+                    for card_id, record in data.items():
+                        record["time"] = datetime.datetime.fromisoformat(record["time"])
+                        self._in_records[card_id] = record
+                    logging.info(f"Loaded old format: {len(self._in_records)} vehicles")
 
             # ✅ Update UI với dữ liệu đã load
             self.ed_total_revenue.setText(f"{self._total_revenue:,}")
@@ -993,18 +932,53 @@ class MainWindow(QMainWindow):
             self._update_slot_counts()
 
         except Exception as e:
-            logging.error(f"[DB] Error loading from MySQL: {e}", exc_info=True)
+            logging.error(f"Error loading in_records.json: {e}", exc_info=True)
+
+    def _save_data_to_db(self):
+        """✅ NEW: Lưu dữ liệu vào in_records.json với structure mới"""
+        try:
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+
+            # Convert in_records to serializable format
+            vehicles = {}
+            for card_id, record in self._in_records.items():
+                vehicles[card_id] = {
+                    "plate": record["plate"],
+                    "time": record["time"].isoformat(),
+                    "card_id": record["card_id"],
+                    "paid": record.get("paid", False)
+                }
+
+            data = {
+                "summary": {
+                    "total_revenue": self._total_revenue,
+                    "daily_in_count": self._total_in_count,
+                    "last_date": today
+                },
+                "vehicles": vehicles
+            }
+
+            with open("in_records.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            logging.info(f"Saved in_records.json: revenue={self._total_revenue:,}, count={self._total_in_count}, vehicles={len(vehicles)}")
+        except Exception as e:
+            logging.error(f"Error saving in_records.json: {e}", exc_info=True)
 
     def _check_midnight(self):
         """✅ NEW: Kiểm tra và reset daily counter vào 00:00"""
         try:
-            # No need to check JSON anymore, just reset counter daily
-            # MySQL keeps full history, so this is just for UI display
-            current_hour = datetime.datetime.now().hour
-            if current_hour == 0 and self._total_in_count > 0:
-                logging.info(f"Midnight reset: daily counter reset")
-                self._total_in_count = 0
-                self.ed_plate_cnt.setText("0")
+            if os.path.exists("in_records.json"):
+                with open("in_records.json", "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if "summary" in data:
+                        last_date = data["summary"].get("last_date", "")
+                        today = datetime.datetime.now().strftime("%Y-%m-%d")
+                        if last_date != today:
+                            logging.info(f"Midnight reset: {last_date} → {today}")
+                            self._total_in_count = 0
+                            self.ed_plate_cnt.setText("0")
+                            self._save_data_to_db()
         except Exception as e:
             logging.error(f"Error in _check_midnight: {e}")
 
@@ -1044,38 +1018,16 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------------------------------------
     # MODEL/OCR
     # ----------------------------------------------------------------------------------------------
-    def _init_models_async(self):
-        """✅ Load ALPR in background thread - don't block UI"""
-        self._alpr_loading = True
-        try:
-            logging.info("[ALPR] Initializing YOLO/EasyOCR in background...")
-            self.alpr = ALPR(YOLO_MODEL_PATH, conf=YOLO_CONF, imgsz=YOLO_IMGSZ,
-                           max_workers=4, cache_ttl=5.0, max_cache_size=100)
-            logging.info("[ALPR] Initialized successfully!")
-        except Exception as e:
-            logging.error(f"[ALPR] Failed to initialize: {e}", exc_info=True)
-            self.alpr = None
-        finally:
-            self._alpr_loading = False
-
-    def _get_alpr_safe(self):
-        """✅ Get ALPR, wait if still loading"""
-        # Wait max 30 seconds for ALPR to load
-        max_wait = 30
-        elapsed = 0
-        while self._alpr_loading and elapsed < max_wait:
-            time.sleep(0.1)
-            elapsed += 0.1
-
-        if self.alpr is None and not self._alpr_loading:
-            logging.warning("[ALPR] Models not initialized yet")
-            return None
-        return self.alpr
-
     def _init_models(self):
-        """Legacy method - kept for compatibility"""
-        if self.alpr is None:
-            self.alpr = self._get_alpr_safe()
+        try:
+            logging.info("Initializing ALPR models...")
+            self.alpr = ALPR(YOLO_MODEL_PATH, conf=YOLO_CONF, imgsz=YOLO_IMGSZ, 
+                           max_workers=4, cache_ttl=5.0, max_cache_size=100)
+            logging.info("ALPR initialized successfully")
+        except Exception as e:
+            logging.error(f"Failed to initialize ALPR: {e}", exc_info=True)
+            self.alpr = None
+            QMessageBox.critical(self, "ALPR", f"Không khởi tạo được YOLO/EasyOCR:\n{e}")
 
     # ----------------------------------------------------------------------------------------------
     # CAMERA
@@ -1153,11 +1105,8 @@ class MainWindow(QMainWindow):
         self.ed_slots_total.setText(str(total))
 
     def _ensure_alpr(self) -> bool:
-        """✅ Check if ALPR is ready, wait if still loading"""
-        alpr = self._get_alpr_safe()
-        if alpr is None:
-            msg = "Đang tải YOLO/EasyOCR..." if self._alpr_loading else "YOLO/EasyOCR lỗi, không thể sử dụng"
-            QMessageBox.warning(self, "ALPR", msg)
+        if self.alpr is None:
+            QMessageBox.warning(self, "ALPR", "Model YOLO/EasyOCR chưa sẵn sàng.")
             return False
         return True
 
@@ -1231,11 +1180,7 @@ class MainWindow(QMainWindow):
                         return
                     frames = [f]
 
-                alpr = self._get_alpr_safe()
-                if alpr is None:
-                    QMessageBox.warning(self, "Chụp IN", "ALPR chưa sẵn sàng")
-                    return
-                plate, debug = alpr.infer_multi(frames)
+                plate, debug = self.alpr.infer_multi(frames)
                 if debug is not None:
                     set_pixmap_fit_no_upscale(self.lbl_img_in, np_to_qimage(debug))
 
@@ -1266,33 +1211,27 @@ class MainWindow(QMainWindow):
                     return
 
                 now = datetime.datetime.now()
-                img_path = self._save_image_with_plate(plate, frames[0], True)
-
-                # Lưu theo mã thẻ (memory cache)
+                # Lưu theo mã thẻ
                 self._in_records[card_id] = {
                     "plate": plate,
                     "time": now,
-                    "card_id": card_id,
-                    "img_path": img_path
+                    "card_id": card_id
                 }
                 logging.info(f"Recorded IN: Card={card_id}, Plate={plate} at {now}")
-
-                # ✅ Save to MySQL
-                if self.db:
-                    try:
-                        self.db.vehicle_entry(card_id, plate, self.cfg.gate_id, img_path)
-                    except Exception as e:
-                        logging.error(f"[DB] Failed to save vehicle entry: {e}")
 
                 self.ed_plate.setText(plate)
                 self.ed_card.setText(card_id)
                 self.ed_tin.setText(now.strftime("%Y-%m-%d %H:%M:%S"))
                 self.ed_tout.clear(); self.ed_tdiff.clear(); self.ed_fee.setText("0")
                 self._update_slot_counts()
+                self._save_image_with_plate(plate, frames[0], True)
 
                 # ✅ Update daily counter
                 self._total_in_count += 1
                 self.ed_plate_cnt.setText(str(self._total_in_count))
+
+                # ✅ Save to DB
+                self._save_data_to_db()
 
                 logging.info(f"✅ Daily counter updated: {self._total_in_count} vehicles today")
 
@@ -1324,11 +1263,7 @@ class MainWindow(QMainWindow):
                         return
                     frames = [f]
 
-                alpr = self._get_alpr_safe()
-                if alpr is None:
-                    QMessageBox.warning(self, "Chụp OUT", "ALPR chưa sẵn sàng")
-                    return
-                plate, debug = alpr.infer_multi(frames)
+                plate, debug = self.alpr.infer_multi(frames)
                 if debug is not None:
                     set_pixmap_fit_no_upscale(self.lbl_img_out, np_to_qimage(debug))
 
@@ -1474,8 +1409,6 @@ class MainWindow(QMainWindow):
                     fee = 0
                     logging.info(f"✅ Already paid via terminal, no fee collected")
 
-                img_path = self._save_image_with_plate(plate, frames[0], False)
-
                 self.ed_plate.setText(plate)
                 self.ed_card.setText(card_id)
                 self.ed_tin.setText(t_in.strftime("%Y-%m-%d %H:%M:%S"))
@@ -1484,18 +1417,10 @@ class MainWindow(QMainWindow):
                 self.ed_fee.setText(f"{fee:,}" if fee > 0 else "Đã thanh toán")
                 self.ed_total_revenue.setText(f"{self._total_revenue:,}")
                 self._update_slot_counts()
+                self._save_image_with_plate(plate, frames[0], False)
 
-                # ✅ Save vehicle exit to MySQL
-                if self.db:
-                    try:
-                        self.db.vehicle_exit(card_id, plate, self.cfg.gate_id, fee, img_path)
-                        # Deduct fee from card balance if applicable
-                        if fee > 0:
-                            card_info = self.db.get_card_info(card_id)
-                            if card_info and card_info.get('card_type') != 'visitor':
-                                self.db.deduct_fee(card_id, fee, self.cfg.gate_id)
-                    except Exception as e:
-                        logging.error(f"[DB] Failed to save vehicle exit: {e}")
+                # ✅ Save to DB
+                self._save_data_to_db()
 
                 logging.info(f"✅ Total revenue: {self._total_revenue:,} VND")
 
@@ -1765,7 +1690,7 @@ class MainWindow(QMainWindow):
 
                             if card_id in self._in_records:
                                 logging.info(f"✅ Card found in records - processing payment")
-                                record = self._in_records[card_id]  # ✅ Don't pop, just mark as paid
+                                record = self._in_records.pop(card_id)
                                 plate = record["plate"]
 
                                 # Update revenue
@@ -1776,16 +1701,8 @@ class MainWindow(QMainWindow):
                                 record["paid"] = True
                                 self._paid_cards[card_id] = datetime.datetime.now()
 
-                                # ✅ Save payment transaction to MySQL
-                                if self.db:
-                                    try:
-                                        card_info = self.db.get_card_info(card_id)
-                                        if card_info:
-                                            # Deduct fee from card
-                                            new_balance = self.db.deduct_fee(card_id, fee, self.cfg.gate_id)
-                                            logging.info(f"[DB] Card balance after payment: {new_balance:,}")
-                                    except Exception as e:
-                                        logging.error(f"[DB] Failed to process payment: {e}")
+                                # Save to DB
+                                self._save_data_to_db()
 
                                 logging.info(f"💰 Payment processed: Card={card_id}, Plate={plate}, Fee={fee:,}, Total={self._total_revenue:,}")
 
@@ -1886,15 +1803,8 @@ class MainWindow(QMainWindow):
                                         record["paid"] = True
                                         self._paid_cards[card_id] = datetime.datetime.now()
 
-                                        # ✅ Save payment to MySQL
-                                        if self.db:
-                                            try:
-                                                card_info = self.db.get_card_info(card_id)
-                                                if card_info:
-                                                    new_balance = self.db.deduct_fee(card_id, fee, self.cfg.gate_id)
-                                                    logging.info(f"[DB] Card balance after payment: {new_balance:,}")
-                                            except Exception as e:
-                                                logging.error(f"[DB] Failed to process payment: {e}")
+                                        # Save to DB
+                                        self._save_data_to_db()
 
                                         logging.info(f"✅ Payment processed via terminal: Card={card_id}, Plate={plate}, Fee={fee:,}, Total={self._total_revenue:,}")
                                         logging.info(f"📝 Vehicle STILL in parking (will exit via RFID-B OUT)")
@@ -1943,14 +1853,9 @@ class MainWindow(QMainWindow):
         """✅ FIXED: Proper cleanup sequence"""
         logging.info("=== CLOSING APPLICATION ===")
 
-        # 1. Close MySQL connection
-        logging.info("Step 1: Closing MySQL connection...")
-        if self.db:
-            try:
-                self.db.close()
-                logging.info("[DB] Connection closed")
-            except Exception as ex:
-                logging.error(f"[DB] Error closing connection: {ex}")
+        # 1. Save data first
+        logging.info("Step 1: Saving data...")
+        self._save_data_to_db()
 
         # 2. Stop cameras
         logging.info("Step 2: Stopping cameras...")
@@ -1997,10 +1902,7 @@ def main():
     logging.info("=" * 80)
     logging.info("Starting Parking Management Application")
     logging.info("=" * 80)
-
-    # Log system info
-    log_system_info()
-
+    
     cfg = load_config()
     if not os.path.exists(cfg.broker_conf):
         Path(cfg.broker_conf).parent.mkdir(parents=True, exist_ok=True)

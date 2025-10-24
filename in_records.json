@@ -1,0 +1,15 @@
+{
+  "summary": {
+    "total_revenue": 3000,
+    "daily_in_count": 2,
+    "last_date": "2025-10-24"
+  },
+  "vehicles": {
+    "D3-CE-84-CD": {
+      "plate": "30-N 23457",
+      "time": "2025-10-24T18:12:17.240366",
+      "card_id": "D3-CE-84-CD",
+      "paid": false
+    }
+  }
+}
